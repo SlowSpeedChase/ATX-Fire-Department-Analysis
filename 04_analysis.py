@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""
+Step 4: Main Analysis
+======================
+Joins incident data with response area demographics and calculates
+per-capita fire incident rates by urban classification and housing typology.
+
+Usage:
+    python scripts/04_analysis.py
+
+Input:
+    processed_data/incidents_clean.csv
+    processed_data/response_areas_with_demographics.geojson
+
+Output:
+    processed_data/incidents_with_demographics.csv
+    processed_data/response_areas_final.geojson
+    outputs/summary_by_urban_class.csv
+    outputs/summary_by_housing_type.csv
+    outputs/statistical_tests.txt
+"""
+
+import pandas as pd
+import geopandas as gpd
+import numpy as np
+from scipy import stats
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def load_data():
+    """Load incident and response area data"""
+    print("\nLoading data...")
+    
+    incidents = pd.read_csv("processed_data/incidents_clean.csv")
+    print(f"  Incidents: {len(incidents):,}")
+    
+    response_areas = gpd.read_file("processed_data/response_areas_with_demographics.geojson")
+    print(f"  Response areas: {len(response_areas)}")
+    
+    return incidents, response_areas
+
+
+def join_incidents_to_response_areas(incidents_df, response_areas_gdf):
+    """
+    Join incidents to response areas.
+    Use the responsearea field from incident data if available,
+    otherwise do spatial join.
+    """
+    print("\nJoining incidents to response areas...")
+    
+    # Find the response area column in incidents
+    ra_col = None
+    for col in incidents_df.columns:
+        if 'responsearea' in col.lower() or 'response_area' in col.lower():
+            ra_col = col
+            break
+    
+    # Find the response area ID in the GeoDataFrame
+    ra_id_col = 'response_area_id'
+    if ra_id_col not in response_areas_gdf.columns:
+        # Try to find it
+        for col in response_areas_gdf.columns:
+            if 'response' in col.lower() or 'area' in col.lower():
+                ra_id_col = col
+                break
+    
+    if ra_col:
+        print(f"  Using responsearea field from incident data: {ra_col}")
+        incidents_df['response_area_id'] = incidents_df[ra_col]
+        
+        # Check match rate
+        ra_ids_in_geo = set(response_areas_gdf[ra_id_col].astype(str).unique())
+        incident_ra_ids = set(incidents_df['response_area_id'].astype(str).unique())
+        matches = len(ra_ids_in_geo & incident_ra_ids)
+        print(f"  Response areas in incidents: {len(incident_ra_ids)}")
+        print(f"  Response areas in boundaries: {len(ra_ids_in_geo)}")
+        print(f"  Matching: {matches}")
+        
+        # Standardize the ID format for joining
+        incidents_df['response_area_id'] = incidents_df['response_area_id'].astype(str)
+        response_areas_gdf['response_area_id'] = response_areas_gdf[ra_id_col].astype(str)
+    else:
+        print("  No responsearea field found, performing spatial join...")
+        # Create GeoDataFrame from incidents
+        valid_coords = incidents_df['latitude'].notna() & incidents_df['longitude'].notna()
+        incidents_geo = gpd.GeoDataFrame(
+            incidents_df[valid_coords],
+            geometry=gpd.points_from_xy(
+                incidents_df.loc[valid_coords, 'longitude'],
+                incidents_df.loc[valid_coords, 'latitude']
+            ),
+            crs="EPSG:4326"
+        )
+        
+        # Spatial join
+        incidents_joined = gpd.sjoin(incidents_geo, response_areas_gdf, how='left', predicate='within')
+        incidents_df = pd.DataFrame(incidents_joined.drop(columns='geometry'))
+    
+    return incidents_df
+
+
+def aggregate_incidents_by_response_area(incidents_df):
+    """
+    Count incidents by response area and category.
+    """
+    print("\nAggregating incidents by response area...")
+    
+    # Total incidents
+    total_counts = incidents_df.groupby('response_area_id').size().reset_index(name='total_incidents')
+    
+    # Structure fires
+    if 'is_structure_fire' in incidents_df.columns:
+        structure_counts = incidents_df.groupby('response_area_id')['is_structure_fire'].sum().reset_index()
+        structure_counts.columns = ['response_area_id', 'structure_fires']
+        total_counts = total_counts.merge(structure_counts, on='response_area_id', how='left')
+    
+    # Vehicle fires
+    if 'is_vehicle_fire' in incidents_df.columns:
+        vehicle_counts = incidents_df.groupby('response_area_id')['is_vehicle_fire'].sum().reset_index()
+        vehicle_counts.columns = ['response_area_id', 'vehicle_fires']
+        total_counts = total_counts.merge(vehicle_counts, on='response_area_id', how='left')
+    
+    # Outdoor fires
+    if 'is_outdoor_fire' in incidents_df.columns:
+        outdoor_counts = incidents_df.groupby('response_area_id')['is_outdoor_fire'].sum().reset_index()
+        outdoor_counts.columns = ['response_area_id', 'outdoor_fires']
+        total_counts = total_counts.merge(outdoor_counts, on='response_area_id', how='left')
+    
+    # By year (for annualized rates)
+    year_col = None
+    for col in incidents_df.columns:
+        if 'year' in col.lower():
+            year_col = col
+            break
+    
+    if year_col:
+        years = incidents_df[year_col].nunique()
+        total_counts['years_of_data'] = years
+        print(f"  Data spans {years} years")
+    
+    print(f"  Aggregated to {len(total_counts)} response areas")
+    
+    return total_counts
+
+
+def merge_incidents_with_demographics(incident_counts_df, response_areas_gdf):
+    """
+    Merge incident counts with response area demographics.
+    """
+    print("\nMerging incidents with demographics...")
+    
+    # Ensure ID columns are same type
+    incident_counts_df['response_area_id'] = incident_counts_df['response_area_id'].astype(str)
+    response_areas_gdf['response_area_id'] = response_areas_gdf['response_area_id'].astype(str)
+    
+    # Merge
+    merged = response_areas_gdf.merge(incident_counts_df, on='response_area_id', how='left')
+    
+    # Fill NaN incident counts with 0
+    incident_cols = ['total_incidents', 'structure_fires', 'vehicle_fires', 'outdoor_fires']
+    for col in incident_cols:
+        if col in merged.columns:
+            merged[col] = merged[col].fillna(0)
+    
+    # Calculate per-capita rates (per 1,000 population)
+    if 'population' in merged.columns:
+        merged['incidents_per_1000_pop'] = np.where(
+            merged['population'] > 0,
+            (merged['total_incidents'] / merged['population']) * 1000,
+            np.nan
+        )
+        if 'structure_fires' in merged.columns:
+            merged['structure_fires_per_1000_pop'] = np.where(
+                merged['population'] > 0,
+                (merged['structure_fires'] / merged['population']) * 1000,
+                np.nan
+            )
+    
+    # Calculate per-housing-unit rates (per 1,000 units)
+    if 'total_units' in merged.columns:
+        merged['incidents_per_1000_units'] = np.where(
+            merged['total_units'] > 0,
+            (merged['total_incidents'] / merged['total_units']) * 1000,
+            np.nan
+        )
+        if 'structure_fires' in merged.columns:
+            merged['structure_fires_per_1000_units'] = np.where(
+                merged['total_units'] > 0,
+                (merged['structure_fires'] / merged['total_units']) * 1000,
+                np.nan
+            )
+    
+    # Annualize if we have years
+    if 'years_of_data' in merged.columns:
+        years = merged['years_of_data'].iloc[0]
+        merged['annual_incidents_per_1000_pop'] = merged['incidents_per_1000_pop'] / years
+        merged['annual_incidents_per_1000_units'] = merged['incidents_per_1000_units'] / years
+    
+    print(f"  Merged dataset: {len(merged)} response areas")
+    
+    return merged
+
+
+def analyze_by_urban_class(merged_gdf):
+    """
+    Calculate summary statistics by urban classification.
+    """
+    print("\nAnalyzing by urban classification...")
+    
+    # Filter to valid data
+    valid = merged_gdf[
+        (merged_gdf['population'] > 0) & 
+        (merged_gdf['urban_class'] != 'unknown')
+    ].copy()
+    
+    # Aggregate
+    summary = valid.groupby('urban_class').agg({
+        'population': 'sum',
+        'total_units': 'sum',
+        'single_family': 'sum',
+        'multifamily': 'sum',
+        'total_incidents': 'sum',
+        'structure_fires': 'sum',
+        'area_sq_miles': 'sum',
+        'response_area_id': 'count'  # Count of response areas
+    }).reset_index()
+    
+    summary.columns = ['urban_class', 'population', 'total_units', 'single_family',
+                       'multifamily', 'total_incidents', 'structure_fires', 
+                       'area_sq_miles', 'num_response_areas']
+    
+    # Calculate rates
+    summary['incidents_per_1000_pop'] = (summary['total_incidents'] / summary['population']) * 1000
+    summary['incidents_per_1000_units'] = (summary['total_incidents'] / summary['total_units']) * 1000
+    summary['structure_fires_per_1000_units'] = (summary['structure_fires'] / summary['total_units']) * 1000
+    summary['pop_density'] = summary['population'] / summary['area_sq_miles']
+    summary['pct_single_family'] = summary['single_family'] / summary['total_units'] * 100
+    
+    # Annualize if we have years data
+    if 'years_of_data' in merged_gdf.columns:
+        years = merged_gdf['years_of_data'].iloc[0]
+        summary['annual_incidents_per_1000_pop'] = summary['incidents_per_1000_pop'] / years
+        summary['annual_incidents_per_1000_units'] = summary['incidents_per_1000_units'] / years
+    
+    # Reorder
+    order = ['urban_core', 'inner_suburban', 'outer_suburban']
+    summary['urban_class'] = pd.Categorical(summary['urban_class'], categories=order, ordered=True)
+    summary = summary.sort_values('urban_class')
+    
+    print("\n" + "="*80)
+    print("SUMMARY BY URBAN CLASSIFICATION")
+    print("="*80)
+    print(summary.to_string(index=False))
+    
+    return summary
+
+
+def analyze_by_housing_type(merged_gdf):
+    """
+    Analyze incident rates by housing typology (% single-family).
+    """
+    print("\nAnalyzing by housing typology...")
+    
+    # Filter to valid data
+    valid = merged_gdf[
+        (merged_gdf['population'] > 0) & 
+        (merged_gdf['total_units'] > 0) &
+        (merged_gdf['pct_single_family'].notna())
+    ].copy()
+    
+    # Create bins
+    valid['sf_category'] = pd.cut(
+        valid['pct_single_family'],
+        bins=[0, 25, 50, 75, 100],
+        labels=['<25% SF', '25-50% SF', '50-75% SF', '>75% SF'],
+        include_lowest=True
+    )
+    
+    # Aggregate
+    summary = valid.groupby('sf_category').agg({
+        'population': 'sum',
+        'total_units': 'sum',
+        'total_incidents': 'sum',
+        'structure_fires': 'sum',
+        'response_area_id': 'count'
+    }).reset_index()
+    
+    summary.columns = ['sf_category', 'population', 'total_units', 'total_incidents',
+                       'structure_fires', 'num_response_areas']
+    
+    # Calculate rates
+    summary['incidents_per_1000_pop'] = (summary['total_incidents'] / summary['population']) * 1000
+    summary['incidents_per_1000_units'] = (summary['total_incidents'] / summary['total_units']) * 1000
+    summary['structure_fires_per_1000_units'] = (summary['structure_fires'] / summary['total_units']) * 1000
+    
+    print("\n" + "="*80)
+    print("SUMMARY BY HOUSING TYPOLOGY")
+    print("="*80)
+    print(summary.to_string(index=False))
+    
+    return summary
+
+
+def run_statistical_tests(merged_gdf):
+    """
+    Run statistical tests to assess significance of differences.
+    """
+    print("\nRunning statistical tests...")
+    
+    results = []
+    
+    # Filter to valid data
+    valid = merged_gdf[
+        (merged_gdf['population'] > 100) &  # Exclude very small areas
+        (merged_gdf['urban_class'] != 'unknown') &
+        (merged_gdf['incidents_per_1000_pop'].notna())
+    ].copy()
+    
+    # T-test: Suburban vs Urban
+    urban = valid[valid['urban_class'] == 'urban_core']['incidents_per_1000_pop']
+    suburban = valid[valid['urban_class'] == 'inner_suburban']['incidents_per_1000_pop']
+    exurban = valid[valid['urban_class'] == 'outer_suburban']['incidents_per_1000_pop']
+    
+    if len(urban) > 0 and len(suburban) > 0:
+        t_stat, p_value = stats.ttest_ind(suburban, urban, equal_var=False)
+        results.append(f"T-test: Inner Suburban vs Urban Core")
+        results.append(f"  Urban mean: {urban.mean():.2f} incidents per 1,000 pop")
+        results.append(f"  Suburban mean: {suburban.mean():.2f} incidents per 1,000 pop")
+        results.append(f"  t-statistic: {t_stat:.3f}")
+        results.append(f"  p-value: {p_value:.4f}")
+        results.append(f"  Significant at α=0.05: {'Yes' if p_value < 0.05 else 'No'}")
+        results.append("")
+    
+    if len(exurban) > 0 and len(urban) > 0:
+        t_stat, p_value = stats.ttest_ind(exurban, urban, equal_var=False)
+        results.append(f"T-test: Outer Suburban vs Urban Core")
+        results.append(f"  Urban mean: {urban.mean():.2f}")
+        results.append(f"  Outer Suburban mean: {exurban.mean():.2f}")
+        results.append(f"  t-statistic: {t_stat:.3f}")
+        results.append(f"  p-value: {p_value:.4f}")
+        results.append(f"  Significant at α=0.05: {'Yes' if p_value < 0.05 else 'No'}")
+        results.append("")
+    
+    # ANOVA across all groups
+    groups = [urban, suburban, exurban]
+    groups = [g for g in groups if len(g) > 0]
+    
+    if len(groups) >= 2:
+        f_stat, p_value = stats.f_oneway(*groups)
+        results.append(f"ANOVA: All Urban Classifications")
+        results.append(f"  F-statistic: {f_stat:.3f}")
+        results.append(f"  p-value: {p_value:.4f}")
+        results.append(f"  Significant at α=0.05: {'Yes' if p_value < 0.05 else 'No'}")
+        results.append("")
+    
+    # Correlation: % Single-Family vs Incident Rate
+    if 'pct_single_family' in valid.columns:
+        corr, p_value = stats.pearsonr(
+            valid['pct_single_family'].dropna(),
+            valid.loc[valid['pct_single_family'].notna(), 'incidents_per_1000_pop']
+        )
+        results.append(f"Correlation: % Single-Family vs Incident Rate")
+        results.append(f"  Pearson r: {corr:.3f}")
+        results.append(f"  p-value: {p_value:.4f}")
+        results.append(f"  Interpretation: {'Positive' if corr > 0 else 'Negative'} correlation")
+        results.append("")
+    
+    # Print results
+    print("\n" + "="*80)
+    print("STATISTICAL TESTS")
+    print("="*80)
+    for line in results:
+        print(line)
+    
+    return "\n".join(results)
+
+
+def main():
+    print("\n" + "#"*60)
+    print("# FIRE RESOURCE ANALYSIS - MAIN ANALYSIS")
+    print("#"*60)
+    
+    # Load data
+    incidents, response_areas = load_data()
+    
+    # Join incidents to response areas
+    incidents = join_incidents_to_response_areas(incidents, response_areas)
+    
+    # Aggregate incidents
+    incident_counts = aggregate_incidents_by_response_area(incidents)
+    
+    # Merge with demographics
+    merged = merge_incidents_with_demographics(incident_counts, response_areas)
+    
+    # Analysis
+    summary_urban = analyze_by_urban_class(merged)
+    summary_housing = analyze_by_housing_type(merged)
+    test_results = run_statistical_tests(merged)
+    
+    # Save outputs
+    os.makedirs("outputs", exist_ok=True)
+    os.makedirs("processed_data", exist_ok=True)
+    
+    summary_urban.to_csv("outputs/summary_by_urban_class.csv", index=False)
+    print(f"\n✓ Saved: outputs/summary_by_urban_class.csv")
+    
+    summary_housing.to_csv("outputs/summary_by_housing_type.csv", index=False)
+    print(f"✓ Saved: outputs/summary_by_housing_type.csv")
+    
+    with open("outputs/statistical_tests.txt", 'w') as f:
+        f.write(test_results)
+    print(f"✓ Saved: outputs/statistical_tests.txt")
+    
+    # Save final geodata
+    merged.to_file("processed_data/response_areas_final.geojson", driver='GeoJSON')
+    print(f"✓ Saved: processed_data/response_areas_final.geojson")
+    
+    # Save incidents with demographics for further analysis
+    incidents.to_csv("processed_data/incidents_with_demographics.csv", index=False)
+    print(f"✓ Saved: processed_data/incidents_with_demographics.csv")
+    
+    # Key findings
+    print("\n" + "="*80)
+    print("KEY FINDINGS")
+    print("="*80)
+    
+    # Compare urban vs suburban rates
+    if len(summary_urban) > 0:
+        urban_rate = summary_urban[summary_urban['urban_class'] == 'urban_core']['incidents_per_1000_pop'].values
+        suburban_rate = summary_urban[summary_urban['urban_class'] == 'inner_suburban']['incidents_per_1000_pop'].values
+        exurban_rate = summary_urban[summary_urban['urban_class'] == 'outer_suburban']['incidents_per_1000_pop'].values
+        
+        if len(urban_rate) > 0 and len(suburban_rate) > 0:
+            diff = ((suburban_rate[0] / urban_rate[0]) - 1) * 100
+            print(f"\nInner suburban areas have {abs(diff):.1f}% {'MORE' if diff > 0 else 'FEWER'} "
+                  f"fire incidents per capita than urban core areas.")
+        
+        if len(urban_rate) > 0 and len(exurban_rate) > 0:
+            diff = ((exurban_rate[0] / urban_rate[0]) - 1) * 100
+            print(f"Outer suburban areas have {abs(diff):.1f}% {'MORE' if diff > 0 else 'FEWER'} "
+                  f"fire incidents per capita than urban core areas.")
+    
+    print("\n" + "="*60)
+    print("NEXT STEPS")
+    print("="*60)
+    print("""
+1. Review outputs/summary_by_urban_class.csv
+   - Do the findings support Tim's hypothesis?
+
+2. Review outputs/statistical_tests.txt
+   - Are the differences statistically significant?
+
+3. Run visualization script:
+   python scripts/05_visualize.py
+
+4. Consider additional analysis:
+   - Control for housing age
+   - Control for income
+   - Separate analysis for structure fires only
+""")
+
+
+if __name__ == "__main__":
+    main()
