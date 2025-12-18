@@ -15,8 +15,5 @@ venv/
 raw_data/
 processed_data/
 
-# Generated outputs
-outputs/
-
 # Claude Code
 .claude/
