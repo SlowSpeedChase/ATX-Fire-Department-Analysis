@@ -16,8 +16,13 @@ Output:
     outputs/map_incidents_per_capita.html
     outputs/map_urban_classification.html
     outputs/map_housing_typology.html
+    outputs/map_building_age.html
+    outputs/map_fire_stations.html
     outputs/chart_urban_comparison.png
     outputs/chart_housing_correlation.png
+    outputs/chart_incident_types.png
+    outputs/chart_building_age.png
+    outputs/chart_time_series.png
 """
 
 import pandas as pd
@@ -340,6 +345,452 @@ def create_summary_table_image(summary_df, filename):
     print(f"    ✓ Saved: outputs/{filename}")
 
 
+def create_incident_type_chart(filename):
+    """Create grouped bar chart of incident rates by type × urban class with yearly breakdown"""
+    print(f"  Creating: {filename}")
+
+    # Load incident type summary
+    if not os.path.exists("outputs/summary_by_incident_type.csv"):
+        print(f"    Warning: summary_by_incident_type.csv not found")
+        return
+
+    df = pd.read_csv("outputs/summary_by_incident_type.csv")
+
+    # Prepare data
+    incident_types = ['structure', 'vehicle', 'outdoor', 'trash', 'other']
+    urban_classes = ['urban_core', 'inner_suburban', 'outer_suburban']
+    labels = ['Urban Core', 'Inner Suburban', 'Outer Suburban']
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    x = range(len(incident_types))
+    width = 0.25
+    colors = ['#d62728', '#ff7f0e', '#2ca02c']
+
+    for i, (uc, label, color) in enumerate(zip(urban_classes, labels, colors)):
+        row = df[df['urban_class'] == uc]
+        if len(row) > 0:
+            rates = [row[f'{t}_per_1000'].values[0] for t in incident_types]
+            bars = ax.bar([xi + i*width for xi in x], rates, width, label=label, color=color, edgecolor='black')
+
+    ax.set_xlabel('Incident Type', fontsize=12)
+    ax.set_ylabel('Incidents per 1,000 Population', fontsize=12)
+    ax.set_title('Fire Incident Rates by Type and Urban Classification', fontsize=14, fontweight='bold')
+    ax.set_xticks([xi + width for xi in x])
+    ax.set_xticklabels(['Structure', 'Vehicle', 'Outdoor', 'Trash/Dumpster', 'Other'])
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(f"outputs/{filename}", dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: outputs/{filename}")
+
+
+def create_incident_type_chart_yearly(filename):
+    """Create grouped bar chart with yearly sub-colors showing 2022, 2023, 2024 breakdown"""
+    print(f"  Creating: {filename}")
+
+    # Load incidents data to get yearly breakdown
+    if not os.path.exists("processed_data/incidents_clean.csv"):
+        print(f"    Warning: incidents_clean.csv not found")
+        return
+
+    incidents = pd.read_csv("processed_data/incidents_clean.csv")
+    ra_demo = gpd.read_file("processed_data/response_areas_final.geojson")
+
+    # Join incidents with urban class
+    incidents['response_area_id'] = incidents['responsearea'].astype(str)
+    ra_demo['response_area_id'] = ra_demo['response_area_id'].astype(str)
+
+    incidents = incidents.merge(
+        ra_demo[['response_area_id', 'urban_class', 'population']],
+        on='response_area_id', how='left'
+    )
+
+    # Filter valid
+    incidents = incidents[incidents['urban_class'].isin(['urban_core', 'inner_suburban', 'outer_suburban'])]
+
+    # Get population by urban class
+    pop_by_class = ra_demo[ra_demo['urban_class'] != 'unknown'].groupby('urban_class')['population'].sum()
+
+    # Count by year, urban class, and type
+    years = [2022, 2023, 2024]
+    urban_classes = ['urban_core', 'inner_suburban', 'outer_suburban']
+    incident_types = ['is_structure_fire', 'is_vehicle_fire', 'is_outdoor_fire', 'is_trash_fire']
+    type_labels = ['Structure', 'Vehicle', 'Outdoor', 'Trash']
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
+
+    year_colors = ['#1f77b4', '#2ca02c', '#ff7f0e']  # Blue=2022, Green=2023, Orange=2024
+    year_labels = ['2022', '2023', '2024']
+
+    for ax_idx, (uc, uc_label) in enumerate(zip(urban_classes, ['Urban Core', 'Inner Suburban', 'Outer Suburban'])):
+        ax = axes[ax_idx]
+        uc_data = incidents[incidents['urban_class'] == uc]
+        pop = pop_by_class.get(uc, 1)
+
+        x = range(len(incident_types))
+        width = 0.25
+
+        for yi, (year, year_color, year_label) in enumerate(zip(years, year_colors, year_labels)):
+            year_data = uc_data[uc_data['calendaryear'] == year]
+            rates = [(year_data[t].sum() / pop) * 1000 for t in incident_types]
+            ax.bar([xi + yi*width for xi in x], rates, width, label=year_label if ax_idx == 0 else '',
+                   color=year_color, edgecolor='black', alpha=0.8)
+
+        ax.set_xlabel('Incident Type', fontsize=11)
+        ax.set_title(uc_label, fontsize=12, fontweight='bold')
+        ax.set_xticks([xi + width for xi in x])
+        ax.set_xticklabels(type_labels, rotation=30, ha='right')
+
+    axes[0].set_ylabel('Incidents per 1,000 Pop', fontsize=11)
+    axes[0].legend(title='Year', loc='upper right')
+
+    fig.suptitle('Fire Incident Rates by Type, Urban Class, and Year', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(f"outputs/{filename}", dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: outputs/{filename}")
+
+
+def create_building_age_chart(filename):
+    """Create bar chart comparing incident rates by building age"""
+    print(f"  Creating: {filename}")
+
+    # Load building age summary
+    if not os.path.exists("outputs/summary_by_building_age.csv"):
+        print(f"    Warning: summary_by_building_age.csv not found")
+        return
+
+    df = pd.read_csv("outputs/summary_by_building_age.csv")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Chart 1: Incidents per 1,000 population
+    ax1 = axes[0]
+    colors = ['#2ca02c', '#d62728']  # Green for newer, red for older
+    bars1 = ax1.bar(df['building_age'], df['incidents_per_1000_pop'], color=colors, edgecolor='black')
+    ax1.set_ylabel('Incidents per 1,000 Population', fontsize=12)
+    ax1.set_title('Total Incident Rate by Building Age', fontsize=14, fontweight='bold')
+    ax1.tick_params(axis='x', rotation=15)
+
+    for bar, val in zip(bars1, df['incidents_per_1000_pop']):
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.2,
+                f'{val:.1f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+
+    # Chart 2: Structure fires per 1,000 units
+    ax2 = axes[1]
+    bars2 = ax2.bar(df['building_age'], df['structure_per_1000_units'], color=colors, edgecolor='black')
+    ax2.set_ylabel('Structure Fires per 1,000 Housing Units', fontsize=12)
+    ax2.set_title('Structure Fire Rate by Building Age', fontsize=14, fontweight='bold')
+    ax2.tick_params(axis='x', rotation=15)
+
+    for bar, val in zip(bars2, df['structure_per_1000_units']):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                f'{val:.2f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(f"outputs/{filename}", dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: outputs/{filename}")
+
+
+def create_building_age_chart_yearly(filename):
+    """Create building age chart with yearly sub-colors showing 2022, 2023, 2024 breakdown"""
+    print(f"  Creating: {filename}")
+
+    # Load incidents data
+    if not os.path.exists("processed_data/incidents_clean.csv"):
+        print(f"    Warning: incidents_clean.csv not found")
+        return
+
+    incidents = pd.read_csv("processed_data/incidents_clean.csv")
+    ra_demo = gpd.read_file("processed_data/response_areas_final.geojson")
+
+    # Check for building age data
+    if 'pct_built_2010_plus' not in ra_demo.columns:
+        print(f"    Warning: building age data not available")
+        return
+
+    # Join incidents with response area data
+    incidents['response_area_id'] = incidents['responsearea'].astype(str)
+    ra_demo['response_area_id'] = ra_demo['response_area_id'].astype(str)
+
+    incidents = incidents.merge(
+        ra_demo[['response_area_id', 'pct_built_2010_plus', 'population']],
+        on='response_area_id', how='left'
+    )
+
+    # Classify areas by building age
+    incidents = incidents[incidents['pct_built_2010_plus'].notna()]
+    incidents['age_class'] = incidents['pct_built_2010_plus'].apply(
+        lambda x: 'Newer (50%+ post-2010)' if x >= 50 else 'Older (<50% post-2010)'
+    )
+
+    # Get population by age class
+    ra_demo['age_class'] = ra_demo['pct_built_2010_plus'].apply(
+        lambda x: 'Newer (50%+ post-2010)' if pd.notna(x) and x >= 50 else 'Older (<50% post-2010)'
+    )
+    pop_by_age = ra_demo.groupby('age_class')['population'].sum()
+
+    years = [2022, 2023, 2024]
+    age_classes = ['Newer (50%+ post-2010)', 'Older (<50% post-2010)']
+    year_colors = ['#1f77b4', '#2ca02c', '#ff7f0e']  # Blue=2022, Green=2023, Orange=2024
+    year_labels = ['2022', '2023', '2024']
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    x = range(len(age_classes))
+    width = 0.25
+
+    for yi, (year, year_color, year_label) in enumerate(zip(years, year_colors, year_labels)):
+        rates = []
+        for ac in age_classes:
+            year_ac_data = incidents[(incidents['calendaryear'] == year) & (incidents['age_class'] == ac)]
+            pop = pop_by_age.get(ac, 1)
+            rate = (len(year_ac_data) / pop) * 1000
+            rates.append(rate)
+        ax.bar([xi + yi*width for xi in x], rates, width, label=year_label,
+               color=year_color, edgecolor='black', alpha=0.8)
+
+    ax.set_xlabel('Building Age Classification', fontsize=12)
+    ax.set_ylabel('Incidents per 1,000 Population', fontsize=12)
+    ax.set_title('Fire Incident Rates by Building Age and Year', fontsize=14, fontweight='bold')
+    ax.set_xticks([xi + width for xi in x])
+    ax.set_xticklabels(age_classes)
+    ax.legend(title='Year', loc='upper right')
+
+    plt.tight_layout()
+    plt.savefig(f"outputs/{filename}", dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: outputs/{filename}")
+
+
+def create_urban_comparison_yearly(filename):
+    """Create urban comparison chart with yearly sub-colors showing 2022, 2023, 2024 breakdown"""
+    print(f"  Creating: {filename}")
+
+    # Load incidents data
+    if not os.path.exists("processed_data/incidents_clean.csv"):
+        print(f"    Warning: incidents_clean.csv not found")
+        return
+
+    incidents = pd.read_csv("processed_data/incidents_clean.csv")
+    ra_demo = gpd.read_file("processed_data/response_areas_final.geojson")
+
+    # Join incidents with urban class
+    incidents['response_area_id'] = incidents['responsearea'].astype(str)
+    ra_demo['response_area_id'] = ra_demo['response_area_id'].astype(str)
+
+    incidents = incidents.merge(
+        ra_demo[['response_area_id', 'urban_class', 'population']],
+        on='response_area_id', how='left'
+    )
+
+    # Filter valid
+    urban_classes = ['urban_core', 'inner_suburban', 'outer_suburban']
+    incidents = incidents[incidents['urban_class'].isin(urban_classes)]
+
+    # Get population by urban class
+    pop_by_class = ra_demo[ra_demo['urban_class'].isin(urban_classes)].groupby('urban_class')['population'].sum()
+
+    years = [2022, 2023, 2024]
+    year_colors = ['#1f77b4', '#2ca02c', '#ff7f0e']  # Blue=2022, Green=2023, Orange=2024
+    year_labels = ['2022', '2023', '2024']
+    uc_labels = ['Urban Core\n(>10k/sq mi)', 'Inner Suburban\n(3-10k/sq mi)', 'Outer Suburban\n(<3k/sq mi)']
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    x = range(len(urban_classes))
+    width = 0.25
+
+    for yi, (year, year_color, year_label) in enumerate(zip(years, year_colors, year_labels)):
+        rates = []
+        for uc in urban_classes:
+            year_uc_data = incidents[(incidents['calendaryear'] == year) & (incidents['urban_class'] == uc)]
+            pop = pop_by_class.get(uc, 1)
+            rate = (len(year_uc_data) / pop) * 1000
+            rates.append(rate)
+        ax.bar([xi + yi*width for xi in x], rates, width, label=year_label,
+               color=year_color, edgecolor='black', alpha=0.8)
+
+    ax.set_xlabel('Urban Classification', fontsize=12)
+    ax.set_ylabel('Incidents per 1,000 Population', fontsize=12)
+    ax.set_title('Fire Incident Rates by Urban Class and Year', fontsize=14, fontweight='bold')
+    ax.set_xticks([xi + width for xi in x])
+    ax.set_xticklabels(uc_labels)
+    ax.legend(title='Year', loc='upper right')
+
+    plt.tight_layout()
+    plt.savefig(f"outputs/{filename}", dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: outputs/{filename}")
+
+
+def create_time_series_chart(filename):
+    """Create time series chart with code change annotation"""
+    print(f"  Creating: {filename}")
+
+    # Load time series data
+    if not os.path.exists("outputs/time_series_analysis.csv"):
+        print(f"    Warning: time_series_analysis.csv not found")
+        return
+
+    df = pd.read_csv("outputs/time_series_analysis.csv")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Plot total incidents
+    ax.plot(df['year'], df['total_incidents'], 'b-o', linewidth=2, markersize=8, label='Total Incidents')
+
+    # Plot structure fires if available
+    if 'structure_fires' in df.columns:
+        ax.plot(df['year'], df['structure_fires'], 'r--s', linewidth=2, markersize=8, label='Structure Fires')
+
+    ax.set_xlabel('Year', fontsize=12)
+    ax.set_ylabel('Number of Incidents', fontsize=12)
+    ax.set_title('Fire Incidents Over Time (AFD)\n2006: Austin sprinkler code adopted (effect in 2010+ buildings)',
+                 fontsize=14, fontweight='bold')
+    ax.legend(loc='upper right')
+
+    # Set integer x-ticks
+    ax.set_xticks(df['year'].values)
+
+    # Add annotation about code change
+    ax.annotate(
+        '2006 sprinkler code\n(visible in 2010+ construction)',
+        xy=(df['year'].min(), df['total_incidents'].max()),
+        xytext=(df['year'].min() + 0.3, df['total_incidents'].max() * 0.85),
+        fontsize=10,
+        bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7)
+    )
+
+    plt.tight_layout()
+    plt.savefig(f"outputs/{filename}", dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: outputs/{filename}")
+
+
+def create_building_age_map(gdf, filename):
+    """Create choropleth map of % post-2010 buildings"""
+    if not HAS_FOLIUM:
+        print(f"  Skipping {filename} (folium not installed)")
+        return
+
+    if 'pct_built_2010_plus' not in gdf.columns:
+        print(f"  Skipping {filename} (building age data not available)")
+        return
+
+    print(f"  Creating: {filename}")
+
+    center_lat = gdf.geometry.centroid.y.mean()
+    center_lon = gdf.geometry.centroid.x.mean()
+
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles='cartodbpositron')
+
+    valid_gdf = gdf[gdf['pct_built_2010_plus'].notna()].copy()
+
+    folium.Choropleth(
+        geo_data=valid_gdf.__geo_interface__,
+        data=valid_gdf,
+        columns=['response_area_id', 'pct_built_2010_plus'],
+        key_on='feature.properties.response_area_id',
+        fill_color='RdYlGn',  # Red=old, Green=new
+        fill_opacity=0.7,
+        line_opacity=0.2,
+        legend_name='% Housing Built 2010 or Later',
+        nan_fill_color='white'
+    ).add_to(m)
+
+    tooltip = folium.GeoJsonTooltip(
+        fields=['response_area_id', 'pct_built_2010_plus', 'pct_built_pre_1970', 'incidents_per_1000_pop'],
+        aliases=['Response Area:', '% Built 2010+:', '% Built pre-1970:', 'Incidents/1000:'],
+        localize=True
+    )
+
+    style_function = lambda x: {'fillColor': '#ffffff', 'color': '#000000', 'fillOpacity': 0, 'weight': 0.1}
+
+    folium.GeoJson(
+        valid_gdf,
+        style_function=style_function,
+        tooltip=tooltip
+    ).add_to(m)
+
+    m.save(f"outputs/{filename}")
+    print(f"    ✓ Saved: outputs/{filename}")
+
+
+def create_station_map(gdf, filename):
+    """Create map with fire stations overlaid on population density"""
+    if not HAS_FOLIUM:
+        print(f"  Skipping {filename} (folium not installed)")
+        return
+
+    stations_path = "raw_data/fire_stations.geojson"
+    if not os.path.exists(stations_path):
+        print(f"  Skipping {filename} (fire stations data not available)")
+        return
+
+    print(f"  Creating: {filename}")
+
+    stations = gpd.read_file(stations_path)
+
+    center_lat = gdf.geometry.centroid.y.mean()
+    center_lon = gdf.geometry.centroid.x.mean()
+
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles='cartodbpositron')
+
+    # Add population density choropleth
+    valid_gdf = gdf[gdf['pop_density'].notna() & (gdf['pop_density'] > 0)].copy()
+
+    folium.Choropleth(
+        geo_data=valid_gdf.__geo_interface__,
+        data=valid_gdf,
+        columns=['response_area_id', 'pop_density'],
+        key_on='feature.properties.response_area_id',
+        fill_color='YlOrRd',
+        fill_opacity=0.5,
+        line_opacity=0.2,
+        legend_name='Population Density (per sq mi)',
+        nan_fill_color='white'
+    ).add_to(m)
+
+    # Add fire stations as markers
+    for idx, station in stations.iterrows():
+        if station.geometry is not None:
+            dept = station.get('DEPARTMENT', 'Unknown')
+            name = station.get('NAME', station.get('STATION_NUMBER', 'Station'))
+
+            # Color by department
+            if dept and dept.upper() in ['AFD', 'AUSTIN', 'AUSTIN FIRE']:
+                color = 'red'
+                icon = 'fire'
+            else:
+                color = 'blue'
+                icon = 'info-sign'
+
+            folium.Marker(
+                location=[station.geometry.y, station.geometry.x],
+                popup=f"{name}<br>{dept}",
+                icon=folium.Icon(color=color, icon=icon, prefix='glyphicon')
+            ).add_to(m)
+
+    # Add legend
+    legend_html = '''
+    <div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000;
+                background-color: white; padding: 10px; border: 2px solid grey;
+                border-radius: 5px; font-size: 14px;">
+    <p><strong>Fire Stations</strong></p>
+    <p>🔴 AFD Stations</p>
+    <p>🔵 Other Jurisdictions</p>
+    </div>
+    '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    m.save(f"outputs/{filename}")
+    print(f"    ✓ Saved: outputs/{filename}")
+
+
 def main():
     print("\n" + "#"*60)
     print("# FIRE RESOURCE ANALYSIS - VISUALIZATION")
@@ -378,12 +829,26 @@ def main():
     else:
         print("  Skipping interactive maps (install folium: pip install folium)")
     
-    # Create charts
+    # Create charts - Original
     print("\nCreating charts...")
-    
+
     create_bar_chart(summary_urban, 'chart_urban_comparison.png')
     create_scatter_plot(ra, 'chart_housing_correlation.png')
     create_summary_table_image(summary_urban, 'table_summary.png')
+
+    # Create charts - New (per Tim's feedback)
+    create_incident_type_chart('chart_incident_types.png')
+    create_incident_type_chart_yearly('chart_incident_types_yearly.png')
+    create_building_age_chart('chart_building_age.png')
+    create_building_age_chart_yearly('chart_building_age_yearly.png')
+    create_urban_comparison_yearly('chart_urban_comparison_yearly.png')
+    create_time_series_chart('chart_time_series.png')
+
+    # Create maps - New
+    print("\nCreating new maps...")
+    if HAS_FOLIUM:
+        create_building_age_map(ra, 'map_building_age.html')
+        create_station_map(ra, 'map_fire_stations.html')
     
     # Summary
     print("\n" + "="*60)

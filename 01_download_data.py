@@ -13,6 +13,8 @@ Output:
     raw_data/afd_response_areas.geojson
     raw_data/census_population.csv
     raw_data/census_housing.csv
+    raw_data/census_year_built.csv
+    raw_data/fire_stations.geojson
     raw_data/travis_county_tracts.geojson
 """
 
@@ -129,8 +131,38 @@ def main():
         "raw_data/census_housing.csv",
         "Census Housing Units by Type (Travis County)"
     )
-    
-    # 6. Census Tract Boundaries (try Census Reporter first, then TIGER)
+
+    # 6. Census Year Structure Built (B25034)
+    year_built_vars = [
+        "B25034_001E",  # Total
+        "B25034_002E",  # Built 2020 or later
+        "B25034_003E",  # Built 2010-2019
+        "B25034_004E",  # Built 2000-2009
+        "B25034_005E",  # Built 1990-1999
+        "B25034_006E",  # Built 1980-1989
+        "B25034_007E",  # Built 1970-1979
+        "B25034_008E",  # Built 1960-1969
+        "B25034_009E",  # Built 1950-1959
+        "B25034_010E",  # Built 1940-1949
+        "B25034_011E",  # Built 1939 or earlier
+        "NAME"
+    ]
+
+    results['census_year_built'] = download_census_api(
+        "B25034",
+        year_built_vars,
+        "raw_data/census_year_built.csv",
+        "Census Year Structure Built (Travis County)"
+    )
+
+    # 7. Fire Station Locations (from ArcGIS)
+    results['fire_stations'] = download_file(
+        "https://services.arcgis.com/0L95CJ0VTaxqcmED/arcgis/rest/services/LOCATION_fire_stations/FeatureServer/0/query?where=1=1&outFields=*&outSR=4326&f=geojson",
+        "raw_data/fire_stations.geojson",
+        "Fire Station Locations"
+    )
+
+    # 8. Census Tract Boundaries (try Census Reporter first, then TIGER)
     results['tract_boundaries'] = download_file(
         "https://www2.census.gov/geo/tiger/TIGER2023/TRACT/tl_2023_48_tract.zip",
         "raw_data/tl_2023_48_tract.zip",

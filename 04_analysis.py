@@ -17,6 +17,10 @@ Output:
     processed_data/response_areas_final.geojson
     outputs/summary_by_urban_class.csv
     outputs/summary_by_housing_type.csv
+    outputs/summary_by_incident_type.csv
+    outputs/summary_by_building_age.csv
+    outputs/time_series_analysis.csv
+    outputs/station_coverage.csv
     outputs/statistical_tests.txt
 """
 
@@ -377,6 +381,260 @@ def run_statistical_tests(merged_gdf):
     return "\n".join(results)
 
 
+def analyze_by_incident_type(incidents_df, merged_gdf):
+    """
+    Analyze incident rates by type (structure, vehicle, outdoor, trash, other)
+    cross-tabulated with urban classification.
+    """
+    print("\nAnalyzing by incident type...")
+
+    # Get year column for annualization
+    year_col = None
+    for col in incidents_df.columns:
+        if 'year' in col.lower():
+            year_col = col
+            break
+
+    years = incidents_df[year_col].nunique() if year_col else 1
+
+    # Count incidents by type and response area
+    incidents_df['response_area_id'] = incidents_df['response_area_id'].astype(str)
+
+    type_counts = incidents_df.groupby('response_area_id').agg({
+        'is_structure_fire': 'sum',
+        'is_vehicle_fire': 'sum',
+        'is_outdoor_fire': 'sum',
+        'is_trash_fire': 'sum'
+    }).reset_index()
+
+    type_counts['other_fires'] = (
+        incidents_df.groupby('response_area_id').size().values -
+        type_counts['is_structure_fire'] - type_counts['is_vehicle_fire'] -
+        type_counts['is_outdoor_fire'] - type_counts['is_trash_fire']
+    )
+
+    type_counts.columns = ['response_area_id', 'structure', 'vehicle', 'outdoor', 'trash', 'other']
+
+    # Merge with demographics
+    merged_gdf['response_area_id'] = merged_gdf['response_area_id'].astype(str)
+    df = merged_gdf[['response_area_id', 'population', 'urban_class']].merge(
+        type_counts, on='response_area_id', how='left'
+    )
+    df = df.fillna(0)
+
+    # Filter to valid data
+    valid = df[(df['population'] > 0) & (df['urban_class'] != 'unknown')].copy()
+
+    # Aggregate by urban class
+    summary = valid.groupby('urban_class').agg({
+        'population': 'sum',
+        'structure': 'sum',
+        'vehicle': 'sum',
+        'outdoor': 'sum',
+        'trash': 'sum',
+        'other': 'sum'
+    }).reset_index()
+
+    # Calculate rates per 1,000 population
+    for col in ['structure', 'vehicle', 'outdoor', 'trash', 'other']:
+        summary[f'{col}_per_1000'] = (summary[col] / summary['population']) * 1000
+        summary[f'{col}_annual_per_1000'] = summary[f'{col}_per_1000'] / years
+
+    # Reorder
+    order = ['urban_core', 'inner_suburban', 'outer_suburban']
+    summary['urban_class'] = pd.Categorical(summary['urban_class'], categories=order, ordered=True)
+    summary = summary.sort_values('urban_class')
+
+    print("\n" + "="*80)
+    print("SUMMARY BY INCIDENT TYPE")
+    print("="*80)
+    rate_cols = ['urban_class', 'population', 'structure_per_1000', 'vehicle_per_1000',
+                 'outdoor_per_1000', 'trash_per_1000', 'other_per_1000']
+    print(summary[rate_cols].to_string(index=False))
+
+    return summary
+
+
+def analyze_by_building_age(merged_gdf):
+    """
+    Analyze incident rates by building age (pre-1970, 1970-2009, 2010+)
+    cross-tabulated with urban classification (2x2 matrix).
+    """
+    print("\nAnalyzing by building age...")
+
+    # Check if building age data exists
+    if 'pct_built_2010_plus' not in merged_gdf.columns:
+        print("  Warning: Building age data not available")
+        return None
+
+    # Filter to valid data
+    valid = merged_gdf[
+        (merged_gdf['population'] > 0) &
+        (merged_gdf['urban_class'] != 'unknown') &
+        (merged_gdf['pct_built_2010_plus'].notna())
+    ].copy()
+
+    # Classify areas by dominant building age
+    # "Newer" = >50% built 2010+, "Older" = <=50% built 2010+
+    valid['building_age_class'] = np.where(
+        valid['pct_built_2010_plus'] >= 50, 'Newer (50%+ post-2010)', 'Older (<50% post-2010)'
+    )
+
+    # Create combined urban × building age category
+    valid['urban_age_combo'] = valid['urban_class'] + ' / ' + valid['building_age_class']
+
+    # Aggregate by building age class
+    summary_age = valid.groupby('building_age_class').agg({
+        'population': 'sum',
+        'total_units': 'sum',
+        'total_incidents': 'sum',
+        'structure_fires': 'sum',
+        'response_area_id': 'count'
+    }).reset_index()
+
+    summary_age.columns = ['building_age', 'population', 'total_units', 'total_incidents',
+                           'structure_fires', 'num_areas']
+    summary_age['incidents_per_1000_pop'] = (summary_age['total_incidents'] / summary_age['population']) * 1000
+    summary_age['structure_per_1000_units'] = (summary_age['structure_fires'] / summary_age['total_units']) * 1000
+
+    # 2x2 Matrix: Urban/Suburban × Old/New
+    # Simplify urban class to just urban vs suburban
+    valid['urban_simple'] = np.where(
+        valid['urban_class'] == 'urban_core', 'Urban Core',
+        np.where(valid['urban_class'] == 'inner_suburban', 'Inner Suburban', 'Outer Suburban')
+    )
+
+    matrix = valid.groupby(['urban_simple', 'building_age_class']).agg({
+        'population': 'sum',
+        'total_incidents': 'sum',
+        'structure_fires': 'sum'
+    }).reset_index()
+
+    matrix['incidents_per_1000'] = (matrix['total_incidents'] / matrix['population']) * 1000
+
+    print("\n" + "="*80)
+    print("SUMMARY BY BUILDING AGE")
+    print("="*80)
+    print(summary_age.to_string(index=False))
+
+    print("\n" + "-"*40)
+    print("2x2 MATRIX: Urban Class × Building Age")
+    print("-"*40)
+    pivot = matrix.pivot(index='urban_simple', columns='building_age_class', values='incidents_per_1000')
+    print(pivot.to_string())
+
+    return summary_age, matrix
+
+
+def analyze_time_series(incidents_df, merged_gdf):
+    """
+    Analyze incident trends over time (2018-2024).
+    """
+    print("\nAnalyzing time series...")
+
+    # Find year column
+    year_col = None
+    for col in incidents_df.columns:
+        if 'year' in col.lower() or 'calendaryear' in col.lower():
+            year_col = col
+            break
+
+    if year_col is None:
+        print("  Warning: Year column not found")
+        return None
+
+    # Get total population for rate calculation
+    total_pop = merged_gdf[merged_gdf['population'] > 0]['population'].sum()
+
+    # Count incidents by year
+    yearly = incidents_df.groupby(year_col).size().reset_index(name='total_incidents')
+    yearly.columns = ['year', 'total_incidents']
+
+    # Count by incident type per year
+    if 'is_structure_fire' in incidents_df.columns:
+        yearly_type = incidents_df.groupby(year_col).agg({
+            'is_structure_fire': 'sum',
+            'is_vehicle_fire': 'sum',
+            'is_outdoor_fire': 'sum'
+        }).reset_index()
+        yearly_type.columns = ['year', 'structure_fires', 'vehicle_fires', 'outdoor_fires']
+        yearly = yearly.merge(yearly_type, on='year', how='left')
+
+    # Calculate rates (per 1,000 population)
+    yearly['incidents_per_1000'] = (yearly['total_incidents'] / total_pop) * 1000
+
+    if 'structure_fires' in yearly.columns:
+        yearly['structure_per_1000'] = (yearly['structure_fires'] / total_pop) * 1000
+
+    # Sort by year
+    yearly = yearly.sort_values('year')
+
+    print("\n" + "="*80)
+    print("TIME SERIES ANALYSIS")
+    print("="*80)
+    print(f"Population base for rates: {total_pop:,.0f}")
+    print(f"\nNote: 2006 Austin sprinkler code change (effect visible in 2010+ buildings)")
+    print()
+    print(yearly.to_string(index=False))
+
+    return yearly
+
+
+def analyze_station_coverage(merged_gdf):
+    """
+    Analyze fire station coverage by urban classification.
+    """
+    print("\nAnalyzing fire station coverage...")
+
+    # Load fire stations
+    import json
+    stations_path = "raw_data/fire_stations.geojson"
+    if not os.path.exists(stations_path):
+        print("  Warning: Fire stations data not available")
+        return None
+
+    stations = gpd.read_file(stations_path)
+    print(f"  Loaded {len(stations)} stations")
+
+    # Filter to AFD stations only
+    if 'DEPARTMENT' in stations.columns:
+        afd_stations = stations[stations['DEPARTMENT'].str.upper().isin(['AFD', 'AUSTIN', 'AUSTIN FIRE'])]
+        print(f"  AFD stations: {len(afd_stations)}")
+    else:
+        afd_stations = stations
+
+    # Calculate stations per urban class
+    # First, spatial join stations to response areas
+    response_areas = merged_gdf.to_crs(stations.crs)
+    stations_joined = gpd.sjoin(afd_stations, response_areas[['response_area_id', 'urban_class', 'geometry']],
+                                 how='left', predicate='within')
+
+    # Count stations by urban class
+    station_counts = stations_joined.groupby('urban_class').size().reset_index(name='num_stations')
+
+    # Get population by urban class
+    pop_by_class = merged_gdf[merged_gdf['urban_class'] != 'unknown'].groupby('urban_class').agg({
+        'population': 'sum',
+        'area_sq_miles': 'sum'
+    }).reset_index()
+
+    # Merge
+    coverage = pop_by_class.merge(station_counts, on='urban_class', how='left')
+    coverage['num_stations'] = coverage['num_stations'].fillna(0)
+
+    # Calculate coverage metrics
+    coverage['pop_per_station'] = coverage['population'] / coverage['num_stations'].replace(0, np.nan)
+    coverage['sq_miles_per_station'] = coverage['area_sq_miles'] / coverage['num_stations'].replace(0, np.nan)
+    coverage['stations_per_100k'] = (coverage['num_stations'] / coverage['population']) * 100000
+
+    print("\n" + "="*80)
+    print("FIRE STATION COVERAGE BY URBAN CLASS")
+    print("="*80)
+    print(coverage.to_string(index=False))
+
+    return coverage
+
+
 def main():
     print("\n" + "#"*60)
     print("# FIRE RESOURCE ANALYSIS - MAIN ANALYSIS")
@@ -394,21 +652,45 @@ def main():
     # Merge with demographics
     merged = merge_incidents_with_demographics(incident_counts, response_areas)
     
-    # Analysis
+    # Analysis - Original
     summary_urban = analyze_by_urban_class(merged)
     summary_housing = analyze_by_housing_type(merged)
     test_results = run_statistical_tests(merged)
-    
+
+    # Analysis - New (per Tim's feedback)
+    summary_incident_type = analyze_by_incident_type(incidents, merged)
+    building_age_results = analyze_by_building_age(merged)
+    time_series = analyze_time_series(incidents, merged)
+    station_coverage = analyze_station_coverage(merged)
+
     # Save outputs
     os.makedirs("outputs", exist_ok=True)
     os.makedirs("processed_data", exist_ok=True)
-    
+
     summary_urban.to_csv("outputs/summary_by_urban_class.csv", index=False)
     print(f"\n✓ Saved: outputs/summary_by_urban_class.csv")
-    
+
     summary_housing.to_csv("outputs/summary_by_housing_type.csv", index=False)
     print(f"✓ Saved: outputs/summary_by_housing_type.csv")
-    
+
+    summary_incident_type.to_csv("outputs/summary_by_incident_type.csv", index=False)
+    print(f"✓ Saved: outputs/summary_by_incident_type.csv")
+
+    if building_age_results is not None:
+        summary_age, matrix = building_age_results
+        summary_age.to_csv("outputs/summary_by_building_age.csv", index=False)
+        matrix.to_csv("outputs/building_age_matrix.csv", index=False)
+        print(f"✓ Saved: outputs/summary_by_building_age.csv")
+        print(f"✓ Saved: outputs/building_age_matrix.csv")
+
+    if time_series is not None:
+        time_series.to_csv("outputs/time_series_analysis.csv", index=False)
+        print(f"✓ Saved: outputs/time_series_analysis.csv")
+
+    if station_coverage is not None:
+        station_coverage.to_csv("outputs/station_coverage.csv", index=False)
+        print(f"✓ Saved: outputs/station_coverage.csv")
+
     with open("outputs/statistical_tests.txt", 'w') as f:
         f.write(test_results)
     print(f"✓ Saved: outputs/statistical_tests.txt")
