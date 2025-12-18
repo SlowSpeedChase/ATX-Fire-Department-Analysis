@@ -627,6 +627,171 @@ def create_urban_comparison_yearly(filename):
     print(f"    ✓ Saved: outputs/{filename}")
 
 
+def create_incident_type_by_building_age_chart(filename):
+    """Create grouped bar chart of incident types by building age"""
+    print(f"  Creating: {filename}")
+
+    # Load and process data
+    incidents = pd.read_csv("processed_data/incidents_clean.csv")
+    ra = gpd.read_file("processed_data/response_areas_final.geojson")
+
+    if 'pct_built_2010_plus' not in ra.columns:
+        print(f"    Warning: building age data not available")
+        return
+
+    # Join
+    incidents['response_area_id'] = incidents['responsearea'].astype(str)
+    ra['response_area_id'] = ra['response_area_id'].astype(str)
+    incidents = incidents.merge(
+        ra[['response_area_id', 'pct_built_2010_plus', 'total_units']],
+        on='response_area_id', how='left'
+    )
+    incidents = incidents[incidents['pct_built_2010_plus'].notna()]
+
+    # Classify
+    incidents['age_class'] = incidents['pct_built_2010_plus'].apply(
+        lambda x: 'Newer\n(50%+ post-2010)' if x >= 50 else 'Older\n(<50% post-2010)'
+    )
+    ra['age_class'] = ra['pct_built_2010_plus'].apply(
+        lambda x: 'Newer\n(50%+ post-2010)' if pd.notna(x) and x >= 50 else 'Older\n(<50% post-2010)'
+    )
+    units_by_age = ra.groupby('age_class')['total_units'].sum()
+
+    # Calculate rates
+    incident_types = ['is_structure_fire', 'is_vehicle_fire', 'is_outdoor_fire', 'is_trash_fire']
+    type_labels = ['Structure\nFire', 'Vehicle\nFire', 'Outdoor/\nVegetation', 'Trash/\nDumpster']
+    age_classes = ['Newer\n(50%+ post-2010)', 'Older\n(<50% post-2010)']
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    x = range(len(incident_types))
+    width = 0.35
+    colors = ['#2ca02c', '#d62728']  # Green=newer, Red=older
+
+    for ai, (age, color) in enumerate(zip(age_classes, colors)):
+        age_data = incidents[incidents['age_class'] == age]
+        units = units_by_age.get(age, 1)
+        rates = [(age_data[it].sum() / units) * 1000 for it in incident_types]
+        bars = ax.bar([xi + ai*width for xi in x], rates, width, label=age.replace('\n', ' '),
+                      color=color, edgecolor='black', alpha=0.85)
+        for bar, rate in zip(bars, rates):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                   f'{rate:.1f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    ax.set_xlabel('Incident Type', fontsize=12)
+    ax.set_ylabel('Incidents per 1,000 Housing Units', fontsize=12)
+    ax.set_title('Fire Incident Rates by Type and Building Age\n(2006 Austin sprinkler code effect visible in structure fires)',
+                 fontsize=14, fontweight='bold')
+    ax.set_xticks([xi + width/2 for xi in x])
+    ax.set_xticklabels(type_labels)
+    ax.legend(title='Building Age', loc='upper left')
+    ax.set_ylim(bottom=0)
+
+    # Add annotation for sprinkler code effect
+    ax.annotate('141% higher\nin older buildings',
+                xy=(0.17, 5.62), xytext=(0.5, 8),
+                fontsize=10, ha='center',
+                arrowprops=dict(arrowstyle='->', color='black'),
+                bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
+
+    plt.tight_layout()
+    plt.savefig(f"outputs/{filename}", dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: outputs/{filename}")
+
+
+def create_structure_fire_housing_trend_chart(filename):
+    """Create grouped bar chart of structure fires by housing type and year"""
+    print(f"  Creating: {filename}")
+
+    if not os.path.exists("outputs/structure_fires_by_housing_trend.csv"):
+        print(f"    Warning: structure_fires_by_housing_trend.csv not found")
+        return
+
+    df = pd.read_csv("outputs/structure_fires_by_housing_trend.csv")
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    housing_types = df['housing_type'].unique()
+    years = sorted(df['year'].unique())
+    year_colors = ['#1f77b4', '#2ca02c', '#ff7f0e']  # Blue, Green, Orange
+
+    x = range(len(housing_types))
+    width = 0.25
+
+    for yi, (year, color) in enumerate(zip(years, year_colors)):
+        year_data = df[df['year'] == year].set_index('housing_type')
+        rates = [year_data.loc[ht, 'fires_per_1000_units'] if ht in year_data.index else 0
+                 for ht in housing_types]
+        bars = ax.bar([xi + yi*width for xi in x], rates, width, label=str(year),
+                      color=color, edgecolor='black', alpha=0.85)
+        # Add value labels
+        for bar, rate in zip(bars, rates):
+            if rate > 0:
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                       f'{rate:.2f}', ha='center', va='bottom', fontsize=9)
+
+    ax.set_xlabel('Housing Type', fontsize=12)
+    ax.set_ylabel('Structure Fires per 1,000 Housing Units', fontsize=12)
+    ax.set_title('Structure Fire Rates by Housing Type and Year\n(Housing fires only - excludes vehicle, trash, outdoor)',
+                 fontsize=14, fontweight='bold')
+    ax.set_xticks([xi + width for xi in x])
+    ax.set_xticklabels(housing_types, rotation=15, ha='right')
+    ax.legend(title='Year', loc='upper right')
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(f"outputs/{filename}", dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: outputs/{filename}")
+
+
+def create_structure_fire_urban_trend_chart(filename):
+    """Create grouped bar chart of structure fires by urban class and year"""
+    print(f"  Creating: {filename}")
+
+    if not os.path.exists("outputs/structure_fires_by_urban_trend.csv"):
+        print(f"    Warning: structure_fires_by_urban_trend.csv not found")
+        return
+
+    df = pd.read_csv("outputs/structure_fires_by_urban_trend.csv")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    urban_classes = ['urban_core', 'inner_suburban', 'outer_suburban']
+    urban_labels = ['Urban Core\n(>10k/sq mi)', 'Inner Suburban\n(3-10k/sq mi)', 'Outer Suburban\n(<3k/sq mi)']
+    years = sorted(df['year'].unique())
+    year_colors = ['#1f77b4', '#2ca02c', '#ff7f0e']
+
+    x = range(len(urban_classes))
+    width = 0.25
+
+    for yi, (year, color) in enumerate(zip(years, year_colors)):
+        year_data = df[df['year'] == year].set_index('urban_class')
+        rates = [year_data.loc[uc, 'fires_per_1000_units'] if uc in year_data.index else 0
+                 for uc in urban_classes]
+        bars = ax.bar([xi + yi*width for xi in x], rates, width, label=str(year),
+                      color=color, edgecolor='black', alpha=0.85)
+        for bar, rate in zip(bars, rates):
+            if rate > 0:
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                       f'{rate:.2f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    ax.set_xlabel('Urban Classification', fontsize=12)
+    ax.set_ylabel('Structure Fires per 1,000 Housing Units', fontsize=12)
+    ax.set_title('Structure Fire Rates by Urban Class and Year\n(Housing fires only - excludes vehicle, trash, outdoor)',
+                 fontsize=14, fontweight='bold')
+    ax.set_xticks([xi + width for xi in x])
+    ax.set_xticklabels(urban_labels)
+    ax.legend(title='Year', loc='upper right')
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(f"outputs/{filename}", dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: outputs/{filename}")
+
+
 def create_time_series_chart(filename):
     """Create time series chart with code change annotation"""
     print(f"  Creating: {filename}")
@@ -843,6 +1008,13 @@ def main():
     create_building_age_chart_yearly('chart_building_age_yearly.png')
     create_urban_comparison_yearly('chart_urban_comparison_yearly.png')
     create_time_series_chart('chart_time_series.png')
+
+    # Structure fire trend charts (housing-only analysis)
+    create_structure_fire_housing_trend_chart('chart_structure_fires_by_housing.png')
+    create_structure_fire_urban_trend_chart('chart_structure_fires_by_urban.png')
+
+    # Incident types by building age (sprinkler code effect)
+    create_incident_type_by_building_age_chart('chart_incident_types_by_age.png')
 
     # Create maps - New
     print("\nCreating new maps...")

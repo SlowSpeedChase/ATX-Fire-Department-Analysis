@@ -580,6 +580,95 @@ def analyze_time_series(incidents_df, merged_gdf):
     return yearly
 
 
+def analyze_structure_fires_by_housing_trend(incidents_df, merged_gdf):
+    """
+    Analyze STRUCTURE FIRE trends by year and housing classification.
+    Focuses only on housing-related fires, excluding vehicle, trash, outdoor fires.
+    """
+    print("\n" + "="*80)
+    print("STRUCTURE FIRE TRENDS BY HOUSING CLASSIFICATION")
+    print("="*80)
+
+    # Find year column
+    year_col = None
+    for col in incidents_df.columns:
+        if 'year' in col.lower() or 'calendaryear' in col.lower():
+            year_col = col
+            break
+
+    if year_col is None:
+        print("  Warning: Year column not found")
+        return None
+
+    # Filter to STRUCTURE FIRES ONLY
+    structure_fires = incidents_df[incidents_df['is_structure_fire'] == True].copy()
+    print(f"\nFiltering to structure fires only: {len(structure_fires):,} incidents")
+    print(f"  (Excluded: {len(incidents_df) - len(structure_fires):,} non-structure incidents)")
+
+    # Join with response area demographics
+    structure_fires['response_area_id'] = structure_fires['response_area_id'].astype(str)
+    merged_gdf['response_area_id'] = merged_gdf['response_area_id'].astype(str)
+
+    # Get housing classification for each response area
+    ra_housing = merged_gdf[['response_area_id', 'urban_class', 'pct_single_family',
+                              'population', 'total_units']].copy()
+
+    # Create housing typology categories
+    ra_housing['housing_type'] = pd.cut(
+        ra_housing['pct_single_family'],
+        bins=[0, 25, 50, 75, 100],
+        labels=['Multifamily (<25% SF)', 'Mixed-low (25-50% SF)',
+                'Mixed-high (50-75% SF)', 'Single-family (>75% SF)'],
+        include_lowest=True
+    )
+
+    # Merge structure fires with housing classification
+    fires_with_housing = structure_fires.merge(
+        ra_housing[['response_area_id', 'urban_class', 'housing_type', 'population', 'total_units']],
+        on='response_area_id', how='left'
+    )
+    fires_with_housing = fires_with_housing[fires_with_housing['housing_type'].notna()]
+
+    # --- TREND BY YEAR AND HOUSING TYPE ---
+    trend_housing = fires_with_housing.groupby([year_col, 'housing_type']).size().reset_index(name='fires')
+    trend_housing.columns = ['year', 'housing_type', 'fires']
+
+    pop_by_housing = ra_housing.groupby('housing_type').agg({
+        'population': 'sum', 'total_units': 'sum'
+    }).reset_index()
+
+    trend_housing = trend_housing.merge(pop_by_housing, on='housing_type', how='left')
+    trend_housing['fires_per_1000_units'] = (trend_housing['fires'] / trend_housing['total_units']) * 1000
+
+    pivot_rates = trend_housing.pivot(index='housing_type', columns='year', values='fires_per_1000_units').fillna(0)
+
+    print("\nStructure Fires per 1,000 Housing Units by Type and Year:")
+    print(pivot_rates.round(2).to_string())
+
+    # --- TREND BY YEAR AND URBAN CLASS ---
+    fires_urban = fires_with_housing[fires_with_housing['urban_class'].isin(
+        ['urban_core', 'inner_suburban', 'outer_suburban'])]
+
+    trend_urban = fires_urban.groupby([year_col, 'urban_class']).size().reset_index(name='fires')
+    trend_urban.columns = ['year', 'urban_class', 'fires']
+
+    pop_by_urban = merged_gdf[merged_gdf['urban_class'] != 'unknown'].groupby('urban_class').agg({
+        'population': 'sum', 'total_units': 'sum'
+    }).reset_index()
+
+    trend_urban = trend_urban.merge(pop_by_urban, on='urban_class', how='left')
+    trend_urban['fires_per_1000_units'] = (trend_urban['fires'] / trend_urban['total_units']) * 1000
+
+    pivot_urban = trend_urban.pivot(index='urban_class', columns='year', values='fires_per_1000_units').fillna(0)
+    pivot_urban = pivot_urban.reindex(['urban_core', 'inner_suburban', 'outer_suburban'])
+
+    print("\nStructure Fires per 1,000 Housing Units by Urban Class and Year:")
+    print(pivot_urban.round(2).to_string())
+
+    return {'trend_by_housing': trend_housing, 'trend_by_urban': trend_urban,
+            'pivot_housing_rates': pivot_rates, 'pivot_urban_rates': pivot_urban}
+
+
 def analyze_station_coverage(merged_gdf):
     """
     Analyze fire station coverage by urban classification.
@@ -663,6 +752,9 @@ def main():
     time_series = analyze_time_series(incidents, merged)
     station_coverage = analyze_station_coverage(merged)
 
+    # Structure fire trends by housing classification
+    structure_fire_trends = analyze_structure_fires_by_housing_trend(incidents, merged)
+
     # Save outputs
     os.makedirs("outputs", exist_ok=True)
     os.makedirs("processed_data", exist_ok=True)
@@ -690,6 +782,16 @@ def main():
     if station_coverage is not None:
         station_coverage.to_csv("outputs/station_coverage.csv", index=False)
         print(f"✓ Saved: outputs/station_coverage.csv")
+
+    if structure_fire_trends is not None:
+        structure_fire_trends['trend_by_housing'].to_csv("outputs/structure_fires_by_housing_trend.csv", index=False)
+        structure_fire_trends['trend_by_urban'].to_csv("outputs/structure_fires_by_urban_trend.csv", index=False)
+        structure_fire_trends['pivot_housing_rates'].to_csv("outputs/structure_fires_housing_pivot.csv")
+        structure_fire_trends['pivot_urban_rates'].to_csv("outputs/structure_fires_urban_pivot.csv")
+        print(f"✓ Saved: outputs/structure_fires_by_housing_trend.csv")
+        print(f"✓ Saved: outputs/structure_fires_by_urban_trend.csv")
+        print(f"✓ Saved: outputs/structure_fires_housing_pivot.csv")
+        print(f"✓ Saved: outputs/structure_fires_urban_pivot.csv")
 
     with open("outputs/statistical_tests.txt", 'w') as f:
         f.write(test_results)
