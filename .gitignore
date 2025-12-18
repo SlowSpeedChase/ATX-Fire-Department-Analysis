@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+venv/
+.env
+
+# Data (downloaded/generated)
+raw_data/
+processed_data/
+
+# Generated outputs
+outputs/
+
+# Claude Code
+.claude/
